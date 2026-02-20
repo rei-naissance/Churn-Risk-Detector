@@ -153,6 +153,7 @@ EXAMPLES: list[str] = [
 
 with gr.Blocks(
     title="📦 Logistics Churn Risk Detector",
+    theme=gr.themes.Soft(),
 ) as demo:
     gr.Markdown(
         "# 📦 Logistics Churn Risk Detector\n"
@@ -196,4 +197,4 @@ with gr.Blocks(
 # Launch
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    demo.launch(theme=gr.themes.Soft())
+    demo.launch()
