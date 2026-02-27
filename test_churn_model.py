@@ -15,10 +15,13 @@ from churn_model import (
     INPUT_MAX_CHARS,
     KEYWORD_BOOST,
     LABELS,
+    POSITIVE_DAMPENER,
     analyze_complaint,
     apply_keyword_boost,
+    apply_positive_dampening,
     build_pipeline,
     detect_keywords,
+    detect_positive_keywords,
     get_training_data,
 )
 
@@ -133,6 +136,8 @@ class TestAnalyzeComplaint:
             "sentiment_score",
             "detected_keywords",
             "keyword_boost_applied",
+            "positive_keywords",
+            "positive_dampening_applied",
             "final_churn_risk_pct",
             "risk_level",
         }
@@ -183,6 +188,75 @@ class TestAnalyzeComplaint:
         )
         assert result["final_churn_risk_pct"] >= 55
         assert len(result["detected_keywords"]) >= 2
+
+    def test_positive_feedback_is_low_risk(self) -> None:
+        """Explicitly positive feedback must not exceed Low band."""
+        result = analyze_complaint("The driver was great and very polite")
+        assert result["risk_level"] == "Low", (
+            f"Expected Low, got {result['risk_level']} "
+            f"({result['final_churn_risk_pct']:.1f}%)"
+        )
+
+    def test_smooth_delivery_is_low_risk(self) -> None:
+        """Smooth delivery experience should be Low risk."""
+        result = analyze_complaint("Friendly staff, smooth delivery experience")
+        assert result["risk_level"] == "Low", (
+            f"Expected Low, got {result['risk_level']} "
+            f"({result['final_churn_risk_pct']:.1f}%)"
+        )
+
+    def test_positive_keywords_are_captured(self) -> None:
+        result = analyze_complaint("The driver was great and very polite")
+        assert len(result["positive_keywords"]) >= 1
+        assert result["positive_dampening_applied"] > 0
+
+    def test_mixed_signal_complaint(self) -> None:
+        """Positive words do not neutralise an explicitly negative complaint."""
+        result = analyze_complaint(
+            "Friendly staff, but my package was lost and I want a refund"
+        )
+        assert result["risk_level"] in ("High", "Critical")
+
+
+# ── detect_positive_keywords ─────────────────────────────────────────────────
+
+class TestDetectPositiveKeywords:
+    def test_finds_single_positive_keyword(self) -> None:
+        assert "great" in detect_positive_keywords("The driver was great")
+
+    def test_finds_multiple_positive_keywords(self) -> None:
+        kws = detect_positive_keywords("Polite and professional courier")
+        assert "polite" in kws
+        assert "professional" in kws
+
+    def test_case_insensitive(self) -> None:
+        assert "excellent" in detect_positive_keywords("EXCELLENT service")
+
+    def test_multi_word_positive_keyword(self) -> None:
+        assert "on time" in detect_positive_keywords("Package arrived on time")
+
+    def test_no_positive_keywords_in_complaint(self) -> None:
+        assert detect_positive_keywords("My package was lost and destroyed") == []
+
+
+# ── apply_positive_dampening ──────────────────────────────────────────────────
+
+class TestApplyPositiveDampening:
+    def test_no_dampening_when_no_positive_keywords(self) -> None:
+        assert apply_positive_dampening(50.0, []) == 50.0
+
+    def test_single_keyword_dampening(self) -> None:
+        assert apply_positive_dampening(50.0, ["great"]) == 50.0 - POSITIVE_DAMPENER
+
+    def test_multiple_keyword_dampening(self) -> None:
+        result = apply_positive_dampening(60.0, ["great", "polite", "smooth"])
+        assert result == 60.0 - 3 * POSITIVE_DAMPENER
+
+    def test_clamped_at_0(self) -> None:
+        assert apply_positive_dampening(5.0, ["great", "excellent", "perfect"]) == 0.0
+
+    def test_does_not_go_below_zero(self) -> None:
+        assert apply_positive_dampening(0.0, ["great"]) == 0.0
 
 
 # ── Pipeline construction ────────────────────────────────────────────────────

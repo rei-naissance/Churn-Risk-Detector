@@ -32,6 +32,7 @@ from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.model_selection import cross_val_score
@@ -54,8 +55,10 @@ __all__ = [
     "COMPLAINTS",
     "LABELS",
     "HIGH_PRIORITY_KEYWORDS",
+    "POSITIVE_KEYWORDS",
     # Tuning / threshold constants
     "KEYWORD_BOOST",
+    "POSITIVE_DAMPENER",
     "RISK_THRESHOLD_CRITICAL",
     "RISK_THRESHOLD_HIGH",
     "RISK_THRESHOLD_MEDIUM",
@@ -66,6 +69,8 @@ __all__ = [
     "train_pipeline",
     "detect_keywords",
     "apply_keyword_boost",
+    "detect_positive_keywords",
+    "apply_positive_dampening",
     "get_pipeline",
     "analyze_complaint",
 ]
@@ -295,6 +300,14 @@ HIGH_PRIORITY_KEYWORDS: list[str] = [
 # matches per complaint; a smaller per-keyword bump avoids over-inflation.
 KEYWORD_BOOST: float = 4.5
 
+# Per-keyword dampening applied when the text contains positive-sentiment
+# keywords (e.g. "great", "polite", "on time").  Acts as the inverse of
+# KEYWORD_BOOST: each positive signal reduces the final risk score.
+# A value slightly larger than KEYWORD_BOOST keeps the net effect honest
+# while ensuring clearly positive feedback lands in the Low band even if
+# the underlying model is uncertain.
+POSITIVE_DAMPENER: float = 8.0
+
 # ---------------------------------------------------------------------------
 # Risk categorisation thresholds (percentage points)
 # ---------------------------------------------------------------------------
@@ -307,6 +320,43 @@ RISK_THRESHOLD_MEDIUM: int = 30
 # Maximum character count accepted by ``analyze_complaint()``.
 # Rejects pathologically long inputs to prevent resource exhaustion.
 INPUT_MAX_CHARS: int = 2_000
+
+# ---------------------------------------------------------------------------
+# 2a. Positive-Sentiment Keywords (for dampening)
+# ---------------------------------------------------------------------------
+# When a complaint contains these words it signals customer satisfaction,
+# not churn risk.  They are used in ``apply_positive_dampening()`` to
+# counteract the model’s tendency to over-predict risk on neutral / positive
+# logistics text (e.g. "driver was great and very polite").
+
+POSITIVE_KEYWORDS: list[str] = [
+    # --- Direct praise ---
+    "great", "excellent", "perfect", "wonderful", "amazing", "fantastic",
+    "outstanding", "superb", "brilliant",
+    # --- Satisfaction language ---
+    "happy", "pleased", "impressed", "delighted", "satisfied", "grateful",
+    "thankful", "appreciate", "appreciated", "loved it",
+    # --- Staff / driver compliments ---
+    "polite", "professional", "courteous", "friendly", "helpful", "kind",
+    "attentive", "dedicated",
+    # --- Smooth experience ---
+    "smooth", "seamless", "easy", "convenient", "flawless", "hassle-free",
+    "no issues", "no problems", "no complaints",
+    # --- Speed / timeliness ---
+    "on time", "on-time", "early", "ahead of schedule", "next day",
+    "fast", "quick", "prompt", "speedy",
+    # --- Condition ---
+    "perfect condition", "well packed", "well packaged", "undamaged",
+    "intact", "safe",
+    # --- Reliability ---
+    "reliable", "consistent", "trustworthy", "recommend", "highly recommend",
+]
+
+_POSITIVE_RE: re.Pattern[str] = re.compile(
+    "|".join(re.escape(kw) for kw in POSITIVE_KEYWORDS),
+    flags=re.IGNORECASE,
+)
+
 
 # ---------------------------------------------------------------------------
 # 3. Build the scikit-learn Pipeline
@@ -338,13 +388,22 @@ def build_pipeline() -> Pipeline:
             ),
             (
                 "clf",
-                RandomForestClassifier(
-                    n_estimators=300,         # more trees for larger dataset
-                    max_depth=None,           # let trees grow fully
-                    min_samples_leaf=2,       # smoother probability estimates
-                    class_weight="balanced",  # counteract any class imbalance
-                    random_state=42,          # reproducibility
-                    n_jobs=-1,                # use all CPU cores
+                # Wrap the Random Forest in isotonic calibration so that the
+                # predicted probabilities are properly scaled (0 = definitely
+                # retained, 1 = definitely churned).  Without calibration,
+                # Random Forests tend to compress probabilities toward 0.5,
+                # inflating the apparent churn risk for positive / neutral text.
+                CalibratedClassifierCV(
+                    RandomForestClassifier(
+                        n_estimators=300,         # more trees for larger dataset
+                        max_depth=None,           # let trees grow fully
+                        min_samples_leaf=2,       # smoother probability estimates
+                        class_weight="balanced",  # counteract any class imbalance
+                        random_state=42,          # reproducibility
+                        n_jobs=-1,                # use all CPU cores
+                    ),
+                    method="isotonic",   # non-parametric — more accurate than sigmoid
+                    cv=3,               # 3-fold to keep training time reasonable
                 ),
             ),
         ]
@@ -447,6 +506,36 @@ def apply_keyword_boost(base_risk: float, keywords: list[str]) -> float:
 # 7. Public API — analyze_complaint()
 # ---------------------------------------------------------------------------
 
+def detect_positive_keywords(text: str) -> list[str]:
+    """
+    Return all positive-sentiment keywords found in *text*.
+
+    These keywords signal customer satisfaction and are used by
+    ``apply_positive_dampening()`` to reduce the churn risk score for
+    clearly positive feedback.
+    """
+    text_lower: str = text.lower()
+    return [kw for kw in POSITIVE_KEYWORDS if kw in text_lower]
+
+
+def apply_positive_dampening(risk: float, positive_keywords: list[str]) -> float:
+    """
+    Reduce the churn risk score for each detected positive-sentiment keyword.
+
+    Acts as the inverse of ``apply_keyword_boost``: each positive signal
+    subtracts ``POSITIVE_DAMPENER`` percentage points.  The result is clamped
+    to [0, 100].
+
+    Why additive dampening?
+    -----------------------
+    Mirrors the keyword-boost logic.  A single strong positive word (e.g.
+    "excellent") is meaningful evidence of satisfaction; multiple positive
+    words compound that evidence and pull the risk score down further.
+    """
+    dampened: float = risk - len(positive_keywords) * POSITIVE_DAMPENER
+    return float(np.clip(dampened, 0.0, 100.0))
+
+
 # ---------------------------------------------------------------------------
 # 7a. Lazy-loaded pipeline singleton (thread-safe double-checked locking)
 # ---------------------------------------------------------------------------
@@ -520,6 +609,17 @@ def analyze_complaint(text: str) -> dict[str, Any]:
     final_risk: float = apply_keyword_boost(proba, keywords)
     boost: float = len(keywords) * KEYWORD_BOOST  # for reporting only
 
+    pos_keywords: list[str] = detect_positive_keywords(text)
+    final_risk = apply_positive_dampening(final_risk, pos_keywords)
+    pos_dampening: float = len(pos_keywords) * POSITIVE_DAMPENER  # for reporting
+
+    # When positive signals are present WITHOUT any churn keywords the customer
+    # is unambiguously satisfied.  Cap the risk at the top of the Low band so
+    # that model uncertainty can never push purely positive text into Medium or
+    # above.
+    if pos_keywords and not keywords:
+        final_risk = min(final_risk, float(RISK_THRESHOLD_MEDIUM - 1))
+
     # --- Risk categorisation --------------------------------------------
     if final_risk >= RISK_THRESHOLD_CRITICAL:
         risk_level = "Critical"
@@ -531,9 +631,11 @@ def analyze_complaint(text: str) -> dict[str, Any]:
         risk_level = "Low"
 
     logger.info(
-        "Keywords=%s | Boost=+%.1f%% | Final risk=%.2f%% (%s)",
+        "Keywords=%s | Boost=+%.1f%% | PosKeywords=%s | Dampening=-%.1f%% | Final risk=%.2f%% (%s)",
         keywords or "none",
         boost,
+        pos_keywords or "none",
+        pos_dampening,
         final_risk,
         risk_level,
     )
@@ -543,6 +645,8 @@ def analyze_complaint(text: str) -> dict[str, Any]:
         "sentiment_score": round(proba, 2),
         "detected_keywords": keywords,
         "keyword_boost_applied": round(boost, 2),
+        "positive_keywords": pos_keywords,
+        "positive_dampening_applied": round(pos_dampening, 2),
         "final_churn_risk_pct": round(final_risk, 2),
         "risk_level": risk_level,
     }

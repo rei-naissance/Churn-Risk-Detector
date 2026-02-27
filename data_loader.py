@@ -78,9 +78,45 @@ _LOGISTICS_RE: re.Pattern[str] = re.compile(
     flags=re.IGNORECASE,
 )
 
+# Keywords that explicitly signal a *churn-inducing* logistics failure.
+# A CFPB narrative is only labelled churn-positive (label 1) when it matches
+# BOTH a logistics keyword AND at least one of these churn-signal words.
+# Without this guard every positive logistics mention — "package arrived on
+# time", "driver was polite" — was mislabelled as churn=1, which caused the
+# model to assign high risk to clearly satisfied customers.
+_CHURN_SIGNAL_KEYWORDS: list[str] = [
+    # Loss / missing
+    "lost", "missing", "disappeared", "vanished", "stolen",
+    # Damage
+    "damaged", "broken", "shattered", "destroyed", "crushed",
+    "cracked", "dented", "ripped", "torn", "water-damaged", "smashed",
+    # Delivery failure
+    "not delivered", "never delivered", "never received", "never arrived",
+    "never showed", "wrong item", "wrong address", "misdelivered",
+    "late", "delayed", "overdue",
+    # Financial
+    "refund", "money back", "reimbursed", "overcharged", "charged twice",
+    "hidden fees", "brokerage", "surcharge",
+    # Escalation language
+    "complaint", "unacceptable", "terrible", "worst", "horrible",
+    "awful", "outrageous", "shambles", "useless", "incompetent",
+    "no response", "cancelled", "hung up", "never called back",
+    "switching to", "competitor", "never use again",
+]
+
+_CHURN_SIGNAL_RE: re.Pattern[str] = re.compile(
+    "|".join(re.escape(kw) for kw in _CHURN_SIGNAL_KEYWORDS),
+    flags=re.IGNORECASE,
+)
+
 # Maximum number of *negative* (non-logistics) samples to keep from the CFPB
 # dataset so we don't swamp the corpus with unrelated finance text.
 _CFPB_NEG_CAP: int = 200
+
+# Maximum number of *positive logistics* samples (logistics keyword match but
+# no churn signal) to keep.  These become retained (label 0) training examples
+# and give the model explicit positive logistics context to learn from.
+_CFPB_POS_LOGISTICS_CAP: int = 300
 
 # Maximum text length (chars) — very long CFPB narratives are trimmed.
 _MAX_TEXT_LEN: int = 500
@@ -123,7 +159,15 @@ def _load_hblim() -> tuple[list[str], list[int]]:
         txt: str = row["text"].strip()  # type: ignore[index]
         if not txt:
             continue
-        lbl: int = 1 if row["label"] == delivery_idx else 0  # type: ignore[index]
+
+        if row["label"] == delivery_idx:  # type: ignore[index]
+            # Only flag as churn when the delivery text contains explicit failure
+            # language.  Without this check, positive delivery mentions like
+            # "arrived on time, great driver" would be mislabelled churn=1.
+            lbl: int = 1 if _CHURN_SIGNAL_RE.search(txt) else 0
+        else:
+            lbl = 0
+
         texts.append(txt)
         labels.append(lbl)
 
@@ -180,8 +224,9 @@ def _load_cfpb() -> tuple[list[str], list[int]]:
 
     logger.info("CFPB text column identified as '%s'", text_col)
 
-    pos_texts: list[str] = []
-    neg_texts: list[str] = []
+    pos_texts: list[str] = []       # logistics + churn signal  → label 1
+    pos_logistics_texts: list[str] = []  # logistics, no churn signal → label 0
+    neg_texts: list[str] = []        # non-logistics              → label 0
 
     for row in ds:
         raw: Any = row[text_col]  # type: ignore[index]
@@ -190,22 +235,32 @@ def _load_cfpb() -> tuple[list[str], list[int]]:
         txt = _truncate(raw.strip())
 
         if _LOGISTICS_RE.search(txt):
-            pos_texts.append(txt)
+            if _CHURN_SIGNAL_RE.search(txt):
+                # Logistics context + explicit failure/churn language → churn
+                pos_texts.append(txt)
+            else:
+                # Positive / neutral logistics mention → retained
+                pos_logistics_texts.append(txt)
         else:
+            # No logistics relevance at all → retained
             neg_texts.append(txt)
 
-    # Cap negative samples so logistics-relevant texts aren't drowned out.
+    # Cap each bucket so no category dominates the merged corpus.
     rng = np.random.default_rng(42)
     if len(neg_texts) > _CFPB_NEG_CAP:
         idx = rng.choice(len(neg_texts), _CFPB_NEG_CAP, replace=False)
         neg_texts = [neg_texts[i] for i in sorted(idx)]
+    if len(pos_logistics_texts) > _CFPB_POS_LOGISTICS_CAP:
+        idx = rng.choice(len(pos_logistics_texts), _CFPB_POS_LOGISTICS_CAP, replace=False)
+        pos_logistics_texts = [pos_logistics_texts[i] for i in sorted(idx)]
 
-    texts = pos_texts + neg_texts
-    labels = [1] * len(pos_texts) + [0] * len(neg_texts)
+    texts = pos_texts + pos_logistics_texts + neg_texts
+    labels = [1] * len(pos_texts) + [0] * len(pos_logistics_texts) + [0] * len(neg_texts)
 
     logger.info(
-        "CFPB: kept %d logistics-positive + %d negative = %d total",
+        "CFPB: %d churn-positive + %d positive-logistics + %d negative = %d total",
         len(pos_texts),
+        len(pos_logistics_texts),
         len(neg_texts),
         len(texts),
     )

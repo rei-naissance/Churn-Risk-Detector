@@ -25,6 +25,7 @@ import gradio as gr
 
 from churn_model import (
     INPUT_MAX_CHARS,
+    POSITIVE_DAMPENER,
     RISK_THRESHOLD_CRITICAL,
     RISK_THRESHOLD_HIGH,
     RISK_THRESHOLD_MEDIUM,
@@ -82,13 +83,24 @@ def predict(complaint: str) -> str:
     sentiment = result["sentiment_score"]
     boost = result["keyword_boost_applied"]
     keywords = result["detected_keywords"]
+    pos_keywords = result["positive_keywords"]
+    pos_dampening = result["positive_dampening_applied"]
 
-    kw_tags = "".join(
+    kw_tags = "" .join(
         f'<span style="display:inline-block;background:{colour}22;'
         f"color:{colour};border:1px solid {colour};border-radius:12px;"
         f'padding:2px 10px;margin:2px 4px 2px 0;font-size:0.85em;">'
         f"{kw}</span>"
         for kw in keywords
+    ) or '<span style="color:#888;font-style:italic;">none detected</span>'
+
+    _POS_COLOUR = "#16a34a"  # green-600
+    pos_kw_tags = "".join(
+        f'<span style="display:inline-block;background:#16a34a22;'
+        f'color:#16a34a;border:1px solid #16a34a;border-radius:12px;'
+        f'padding:2px 10px;margin:2px 4px 2px 0;font-size:0.85em;">'
+        f"{kw}</span>"
+        for kw in pos_keywords
     ) or '<span style="color:#888;font-style:italic;">none detected</span>'
 
     # Risk gauge bar
@@ -121,14 +133,22 @@ def predict(complaint: str) -> str:
                 <td style="padding:8px 4px;text-align:right;font-weight:600;">+{boost:.1f}%</td>
             </tr>
             <tr style="border-bottom:1px solid #e5e7eb;">
+                <td style="padding:8px 4px;color:#6b7280;">Positive Signal Dampening</td>
+                <td style="padding:8px 4px;text-align:right;font-weight:600;color:#16a34a;">&minus;{pos_dampening:.1f}%</td>
+            </tr>
+            <tr style="border-bottom:1px solid #e5e7eb;">
                 <td style="padding:8px 4px;color:#6b7280;">Final Churn Risk</td>
                 <td style="padding:8px 4px;text-align:right;font-weight:700;color:{colour};">{pct:.1f}%</td>
             </tr>
         </table>
 
         <div style="margin-top:16px;">
-            <div style="color:#6b7280;font-size:0.85em;margin-bottom:4px;">Detected Keywords</div>
+            <div style="color:#6b7280;font-size:0.85em;margin-bottom:4px;">Risk Signals (churn indicators)</div>
             {kw_tags}
+        </div>
+        <div style="margin-top:10px;">
+            <div style="color:#6b7280;font-size:0.85em;margin-bottom:4px;">Positive Signals (satisfaction indicators)</div>
+            {pos_kw_tags}
         </div>
     </div>
     """
