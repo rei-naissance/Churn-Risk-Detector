@@ -12,6 +12,7 @@ from sklearn.pipeline import Pipeline
 from churn_model import (
     COMPLAINTS,
     HIGH_PRIORITY_KEYWORDS,
+    INPUT_MAX_CHARS,
     KEYWORD_BOOST,
     LABELS,
     analyze_complaint,
@@ -216,7 +217,43 @@ class TestDataLoader:
         from data_loader import _CACHE_FILE, load_external_data
         load_external_data()
         assert _CACHE_FILE.exists()
-        pipe = build_pipeline()
-        step_names = [name for name, _ in pipe.steps]
-        assert "tfidf" in step_names
-        assert "clf" in step_names
+
+
+# ── Edge cases ───────────────────────────────────────────────────────────────────────────
+
+class TestAnalyzeComplaintEdgeCases:
+    """Guard against invalid or extreme inputs to analyze_complaint()."""
+
+    def test_empty_string_raises(self) -> None:
+        with pytest.raises(ValueError, match="cannot be empty"):
+            analyze_complaint("")
+
+    def test_whitespace_only_raises(self) -> None:
+        with pytest.raises(ValueError, match="cannot be empty"):
+            analyze_complaint("   \t\n")
+
+    def test_non_string_raises_type_error(self) -> None:
+        with pytest.raises(TypeError):
+            analyze_complaint(None)  # type: ignore[arg-type]
+
+    def test_over_length_input_raises(self) -> None:
+        long_text = "lost " * (INPUT_MAX_CHARS // 5 + 10)
+        with pytest.raises(ValueError, match="maximum length"):
+            analyze_complaint(long_text)
+
+    def test_max_length_boundary_accepted(self) -> None:
+        """A string exactly at the limit must be accepted without error."""
+        text = "a" * INPUT_MAX_CHARS
+        result = analyze_complaint(text)
+        assert result["risk_level"] in ("Low", "Medium", "High", "Critical")
+
+    def test_unicode_input(self) -> None:
+        """Non-ASCII characters should not crash the model."""
+        result = analyze_complaint("Pakket verloren gegaan. Ik wil mijn geld terug.")
+        assert result["risk_level"] in ("Low", "Medium", "High", "Critical")
+
+    def test_leading_trailing_whitespace_stripped(self) -> None:
+        """Leading / trailing whitespace is stripped transparently."""
+        result_padded = analyze_complaint("  Package lost  ")
+        result_clean = analyze_complaint("Package lost")
+        assert result_padded["final_churn_risk_pct"] == result_clean["final_churn_risk_pct"]

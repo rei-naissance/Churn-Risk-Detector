@@ -17,9 +17,22 @@ Created: 2026-02-20
 
 from __future__ import annotations
 
+import functools
+import logging
+import os
+
 import gradio as gr
 
-from churn_model import analyze_complaint, get_training_data
+from churn_model import (
+    INPUT_MAX_CHARS,
+    RISK_THRESHOLD_CRITICAL,
+    RISK_THRESHOLD_HIGH,
+    RISK_THRESHOLD_MEDIUM,
+    analyze_complaint,
+    get_training_data,
+)
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Colour helpers
@@ -49,7 +62,18 @@ def predict(complaint: str) -> str:
     if not complaint or not complaint.strip():
         return _placeholder_html()
 
-    result = analyze_complaint(complaint.strip())
+    complaint = complaint.strip()
+    if len(complaint) > INPUT_MAX_CHARS:
+        return _error_html(
+            f"Complaint is too long ({len(complaint):,} characters). "
+            f"Please keep it under {INPUT_MAX_CHARS:,} characters."
+        )
+
+    try:
+        result = analyze_complaint(complaint)
+    except Exception as exc:
+        logger.exception("Unexpected error while analysing complaint.")
+        return _error_html(f"Analysis failed: {exc}")
 
     risk = result["risk_level"]
     colour = _RISK_COLOURS[risk]
@@ -120,10 +144,21 @@ def _placeholder_html() -> str:
     )
 
 
+def _error_html(message: str) -> str:
+    """Return an HTML error card displayed in the results panel."""
+    return (
+        '<div style="text-align:center;color:#dc2626;padding:40px 0;'
+        'font-family:system-ui,sans-serif;">'
+        f"<p>⚠️ {message}</p>"
+        "</div>"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Training stats (shown in the sidebar / description)
 # ---------------------------------------------------------------------------
 
+@functools.lru_cache(maxsize=None)
 def _get_stats_md() -> str:
     X, y = get_training_data()
     n_total = len(X)
@@ -187,7 +222,10 @@ with gr.Blocks(
         "---\n"
         "**How it works:** TF-IDF (uni+bigrams, 5 000 features) → "
         "Random Forest (300 trees) → keyword boost (+4.5 % per match). "
-        "Risk bands: 🟢 <30 % Low · 🟡 ≥30 % Medium · 🟠 ≥55 % High · 🔴 ≥80 % Critical.\n\n"
+        f"Risk bands: 🟢 <{RISK_THRESHOLD_MEDIUM} % Low · "
+        f"🟡 ≥{RISK_THRESHOLD_MEDIUM} % Medium · "
+        f"🟠 ≥{RISK_THRESHOLD_HIGH} % High · "
+        f"🔴 ≥{RISK_THRESHOLD_CRITICAL} % Critical.\n\n"
         "Data: [hblim/customer-complaints](https://huggingface.co/datasets/hblim/customer-complaints) · "
         "[aciborowska/customers-complaints](https://huggingface.co/datasets/aciborowska/customers-complaints) · "
         "Trustpilot-inspired seed corpus"
@@ -197,4 +235,7 @@ with gr.Blocks(
 # Launch
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    demo.launch()
+    demo.launch(
+        server_name=os.environ.get("SERVER_NAME", "0.0.0.0"),
+        server_port=int(os.environ.get("SERVER_PORT", "7860")),
+    )

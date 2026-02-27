@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from typing import Any
 
 import numpy as np
@@ -39,14 +40,35 @@ from sklearn.pipeline import Pipeline
 from data_loader import load_external_data
 
 # ---------------------------------------------------------------------------
-# Logging
+# Logging — library code must NOT call logging.basicConfig().
+# The calling application (app.py, CLI scripts, test suite) is responsible
+# for configuring the root logger to the desired level and format.
 # ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Public API surface
+# ---------------------------------------------------------------------------
+__all__ = [
+    # Data constants
+    "COMPLAINTS",
+    "LABELS",
+    "HIGH_PRIORITY_KEYWORDS",
+    # Tuning / threshold constants
+    "KEYWORD_BOOST",
+    "RISK_THRESHOLD_CRITICAL",
+    "RISK_THRESHOLD_HIGH",
+    "RISK_THRESHOLD_MEDIUM",
+    "INPUT_MAX_CHARS",
+    # Functions
+    "build_pipeline",
+    "get_training_data",
+    "train_pipeline",
+    "detect_keywords",
+    "apply_keyword_boost",
+    "get_pipeline",
+    "analyze_complaint",
+]
 
 # ---------------------------------------------------------------------------
 # 1. Hand-Curated Seed Data (120 samples)
@@ -274,6 +296,19 @@ HIGH_PRIORITY_KEYWORDS: list[str] = [
 KEYWORD_BOOST: float = 4.5
 
 # ---------------------------------------------------------------------------
+# Risk categorisation thresholds (percentage points)
+# ---------------------------------------------------------------------------
+# Exported so consumer code (e.g. the Gradio UI footer) stays in sync with
+# any future changes to these thresholds automatically.
+RISK_THRESHOLD_CRITICAL: int = 80
+RISK_THRESHOLD_HIGH: int = 55
+RISK_THRESHOLD_MEDIUM: int = 30
+
+# Maximum character count accepted by ``analyze_complaint()``.
+# Rejects pathologically long inputs to prevent resource exhaustion.
+INPUT_MAX_CHARS: int = 2_000
+
+# ---------------------------------------------------------------------------
 # 3. Build the scikit-learn Pipeline
 # ---------------------------------------------------------------------------
 
@@ -412,8 +447,29 @@ def apply_keyword_boost(base_risk: float, keywords: list[str]) -> float:
 # 7. Public API — analyze_complaint()
 # ---------------------------------------------------------------------------
 
-# Module-level singleton: trained once on import.
-_pipeline: Pipeline = train_pipeline(build_pipeline())
+# ---------------------------------------------------------------------------
+# 7a. Lazy-loaded pipeline singleton (thread-safe double-checked locking)
+# ---------------------------------------------------------------------------
+# Training — including 5-fold cross-validation — is deferred until the first
+# call to ``get_pipeline()`` or ``analyze_complaint()``.  This avoids
+# expensive model training on every module import, which matters most during
+# pytest runs that only exercise helper functions like ``detect_keywords``.
+_pipeline: Pipeline | None = None
+_pipeline_lock: threading.Lock = threading.Lock()
+
+
+def get_pipeline() -> Pipeline:
+    """Return the trained pipeline, building it on the first call (thread-safe).
+
+    Uses double-checked locking so concurrent requests in a multi-worker
+    Gradio deployment do not race to start parallel training jobs.
+    """
+    global _pipeline
+    if _pipeline is None:
+        with _pipeline_lock:
+            if _pipeline is None:  # re-check inside the lock
+                _pipeline = train_pipeline(build_pipeline())
+    return _pipeline
 
 
 def analyze_complaint(text: str) -> dict[str, Any]:
@@ -441,24 +497,35 @@ def analyze_complaint(text: str) -> dict[str, Any]:
     >>> result["risk_level"]
     'Critical'
     """
+    # --- Input validation -----------------------------------------------
+    if not isinstance(text, str):
+        raise TypeError(f"Expected str, got {type(text).__name__!r}.")
+    text = text.strip()
+    if not text:
+        raise ValueError("Input text cannot be empty.")
+    if len(text) > INPUT_MAX_CHARS:
+        raise ValueError(
+            f"Input exceeds maximum length of {INPUT_MAX_CHARS:,} characters "
+            f"(received {len(text):,})."
+        )
+
     # --- Model inference ------------------------------------------------
     # predict_proba returns [[P(class 0), P(class 1)]].
     # Class 1 = "churn", so we take index 1.
-    proba: float = float(_pipeline.predict_proba([text])[0][1]) * 100.0
+    proba: float = float(get_pipeline().predict_proba([text])[0][1]) * 100.0
     logger.info("Raw model churn probability for input: %.2f%%", proba)
 
     # --- Post-processing ------------------------------------------------
     keywords: list[str] = detect_keywords(text)
-    boost: float = len(keywords) * KEYWORD_BOOST
     final_risk: float = apply_keyword_boost(proba, keywords)
+    boost: float = len(keywords) * KEYWORD_BOOST  # for reporting only
 
     # --- Risk categorisation --------------------------------------------
-    # Thresholds chosen to mirror typical logistics SLA escalation bands.
-    if final_risk >= 80:
+    if final_risk >= RISK_THRESHOLD_CRITICAL:
         risk_level = "Critical"
-    elif final_risk >= 55:
+    elif final_risk >= RISK_THRESHOLD_HIGH:
         risk_level = "High"
-    elif final_risk >= 30:
+    elif final_risk >= RISK_THRESHOLD_MEDIUM:
         risk_level = "Medium"
     else:
         risk_level = "Low"

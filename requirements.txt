@@ -1,4 +1,8 @@
+# Production dependencies
 scikit-learn>=1.3
 numpy>=1.24
 datasets>=3.0
 gradio==5.29.1
+
+# Development / test dependencies
+pytest>=7.0
